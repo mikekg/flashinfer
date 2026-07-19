@@ -75,8 +75,13 @@ class Runtime {
       return false;
     }
 
-    // Check if all necessary files exist
-    return std::filesystem::exists(std::filesystem::path(path) / kKernelName);
+    // Reject incomplete artifacts left by an interrupted compilation.
+    std::filesystem::path cubinPath = std::filesystem::path(path) / kKernelName;
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(cubinPath, error)) {
+      return false;
+    }
+    return std::filesystem::file_size(cubinPath, error) > 0 && !error;
   }
 
   CUkernel getKernel() {

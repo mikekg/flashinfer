@@ -42,9 +42,47 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
 #endif
 
 namespace deep_gemm::jit {
+
+class CacheFileLock {
+ public:
+  explicit CacheFileLock(std::filesystem::path const& path) {
+#ifndef _WIN32
+    fd_ = open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0666);
+    if (fd_ < 0) {
+      throw std::runtime_error("Failed to lock DeepGEMM JIT cache");
+    }
+    if (flock(fd_, LOCK_EX) != 0) {
+      close(fd_);
+      fd_ = -1;
+      throw std::runtime_error("Failed to lock DeepGEMM JIT cache");
+    }
+#endif
+  }
+
+  ~CacheFileLock() {
+#ifndef _WIN32
+    if (fd_ >= 0) {
+      flock(fd_, LOCK_UN);
+      close(fd_);
+    }
+#endif
+  }
+
+  CacheFileLock(CacheFileLock const&) = delete;
+  CacheFileLock& operator=(CacheFileLock const&) = delete;
+
+ private:
+#ifndef _WIN32
+  int fd_{-1};
+#endif
+};
 
 // Generate a unique ID for temporary directories to avoid collisions
 inline std::string generateUniqueId() {
@@ -277,6 +315,15 @@ class Compiler {
       return cachedRuntime;
     }
 
+    // A model server starts one worker per GPU. Serialize a cold build for a
+    // given kernel so workers do not launch several memory-heavy NVCC jobs or
+    // replace the same cache artifact concurrently.
+    CacheFileLock cacheLock(getCacheDir() / (name + ".lock"));
+    cachedRuntime = runtimeCache[path.string()];
+    if (cachedRuntime != nullptr) {
+      return cachedRuntime;
+    }
+
     // Compiler flags
     std::vector<std::string> flags = {"-std=c++17",
                                       "--gpu-architecture=sm_90a",
@@ -369,6 +416,7 @@ class Compiler {
       FILE* pipe = popen(cmd.c_str(), "r");
 #endif
 
+      int compileStatus = -1;
       if (pipe) {
         // Read the output
         while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
@@ -377,9 +425,9 @@ class Compiler {
 
 // Close the pipe
 #ifdef _MSC_VER
-        _pclose(pipe);
+        compileStatus = _pclose(pipe);
 #else
-        pclose(pipe);
+        compileStatus = pclose(pipe);
 #endif
 
         // Output result if debug enabled
@@ -389,6 +437,12 @@ class Compiler {
           TLLM_LOG_INFO("NVCC compilation took %d ms", duration.count());
           TLLM_LOG_INFO("Compilation log:\n%s", result.c_str());
         }
+      }
+
+      if (compileStatus != 0 || !std::filesystem::exists(tmpCubinPath) ||
+          std::filesystem::file_size(tmpCubinPath) == 0) {
+        std::filesystem::remove_all(tmpPath);
+        throw std::runtime_error("NVCC compilation failed: " + result);
       }
     } else {
       nvrtcProgram prog;
@@ -449,12 +503,14 @@ class Compiler {
     try {
       // Rename (atomic operation) to final locations
       std::filesystem::rename(tmpCubinPath, cubinPath);
-      if (kJitDebugging) {
-        TLLM_LOG_INFO("Successfully copied kernel files to cache directory: %s",
-                      path.string().c_str());
-      }
-    } catch (std::exception const& e) {
-      TLLM_LOG_ERROR("Warning: Failed to copy kernel files to cache: %s", e.what());
+    } catch (...) {
+      std::error_code ignored;
+      std::filesystem::remove_all(tmpPath, ignored);
+      throw;
+    }
+    if (kJitDebugging) {
+      TLLM_LOG_INFO("Successfully copied kernel files to cache directory: %s",
+                    path.string().c_str());
     }
 
     // Clean up temporary directory after successful compilation
