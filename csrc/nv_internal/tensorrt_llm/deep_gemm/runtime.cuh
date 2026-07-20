@@ -25,6 +25,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "cache_file_utils.h"
 #include "jit_utils.cuh"
 #include "scheduler.cuh"
 
@@ -77,11 +78,7 @@ class Runtime {
 
     // Reject incomplete artifacts left by an interrupted compilation.
     std::filesystem::path cubinPath = std::filesystem::path(path) / kKernelName;
-    std::error_code error;
-    if (!std::filesystem::is_regular_file(cubinPath, error)) {
-      return false;
-    }
-    return std::filesystem::file_size(cubinPath, error) > 0 && !error;
+    return isRegularNonEmptyFile(cubinPath);
   }
 
   CUkernel getKernel() {

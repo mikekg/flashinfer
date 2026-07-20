@@ -32,6 +32,7 @@
 #include <string>
 #include <vector>
 
+#include "cache_file_utils.h"
 #include "jit_utils.cuh"
 #include "nvrtc.h"
 #include "runtime.cuh"
@@ -42,47 +43,9 @@
 
 #ifdef _WIN32
 #include <windows.h>
-#else
-#include <fcntl.h>
-#include <sys/file.h>
-#include <unistd.h>
 #endif
 
 namespace deep_gemm::jit {
-
-class CacheFileLock {
- public:
-  explicit CacheFileLock(std::filesystem::path const& path) {
-#ifndef _WIN32
-    fd_ = open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0666);
-    if (fd_ < 0) {
-      throw std::runtime_error("Failed to lock DeepGEMM JIT cache");
-    }
-    if (flock(fd_, LOCK_EX) != 0) {
-      close(fd_);
-      fd_ = -1;
-      throw std::runtime_error("Failed to lock DeepGEMM JIT cache");
-    }
-#endif
-  }
-
-  ~CacheFileLock() {
-#ifndef _WIN32
-    if (fd_ >= 0) {
-      flock(fd_, LOCK_UN);
-      close(fd_);
-    }
-#endif
-  }
-
-  CacheFileLock(CacheFileLock const&) = delete;
-  CacheFileLock& operator=(CacheFileLock const&) = delete;
-
- private:
-#ifndef _WIN32
-  int fd_{-1};
-#endif
-};
 
 // Generate a unique ID for temporary directories to avoid collisions
 inline std::string generateUniqueId() {
@@ -439,8 +402,7 @@ class Compiler {
         }
       }
 
-      if (compileStatus != 0 || !std::filesystem::exists(tmpCubinPath) ||
-          std::filesystem::file_size(tmpCubinPath) == 0) {
+      if (compileStatus != 0 || !isRegularNonEmptyFile(tmpCubinPath)) {
         std::filesystem::remove_all(tmpPath);
         throw std::runtime_error("NVCC compilation failed: " + result);
       }
